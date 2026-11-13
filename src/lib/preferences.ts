@@ -7,14 +7,18 @@
  */
 
 import { storage } from '@/lib/storage';
+import { DEFAULT_NAV_PATHS, NAV_CHANGED_EVENT } from '@/lib/nav';
 
 export interface IPreferences {
   /** 默认提醒提前量（分钟）。0 表示准时提醒。 */
   defaultLeadMinutes: number;
+  /** 底部导航显示哪些页面、按什么顺序。存 path，注册表见 lib/nav.ts。 */
+  navPaths: string[];
 }
 
 export const DEFAULT_PREFERENCES: IPreferences = {
   defaultLeadMinutes: 30,
+  navPaths: DEFAULT_NAV_PATHS,
 };
 
 /** 提前量下拉的候选值。数值即分钟数，文案由 describeLeadMinutes 生成，避免两处各写一份中文。 */
@@ -52,10 +56,23 @@ export function getPreferences(): IPreferences {
   const stored = storage.getPreferences<Partial<IPreferences> | null>(null);
   if (!stored || typeof stored !== 'object') return { ...DEFAULT_PREFERENCES };
   const lead = Number(stored.defaultLeadMinutes);
+  // 旧版本没有 navPaths；写坏了的数组（含非字符串）也退回默认，
+  // 让 resolveNavItems 只需要处理「未注册的 path」一种情况。
+  const navPaths =
+    Array.isArray(stored.navPaths) && stored.navPaths.every((p) => typeof p === 'string')
+      ? (stored.navPaths as string[])
+      : DEFAULT_PREFERENCES.navPaths;
   return {
     ...DEFAULT_PREFERENCES,
     defaultLeadMinutes: Number.isFinite(lead) && lead >= 0 ? lead : DEFAULT_PREFERENCES.defaultLeadMinutes,
+    navPaths,
   };
+}
+
+/** 保存导航配置并广播，底部导航收到后重新读取。 */
+export function setNavPaths(paths: string[]): void {
+  storage.setPreferences({ ...getPreferences(), navPaths: paths });
+  window.dispatchEvent(new Event(NAV_CHANGED_EVENT));
 }
 
 export function getDefaultLeadMinutes(): number {

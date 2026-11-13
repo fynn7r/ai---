@@ -22,7 +22,7 @@ test('核对、修改时间后保存，导航及刷新后待办和解析历史�
     expect(route.request().postDataJSON()).toMatchObject({ referenceDate: '2026-10-05', timezone: 'Asia/Shanghai' });
     await route.fulfill({ json: parsed });
   });
-  await page.goto('/');
+  await page.goto('/parse');
   await page.getByLabel('通知参考日期').fill('2026-10-05');
   await page.getByLabel('通知原文').fill(notice);
   await page.getByRole('button', { name: '智能解析', exact: true }).click();
@@ -61,7 +61,7 @@ test('缺失截止时间时要求补齐，拒绝把活动开始直接保存为�
     ...parsed, notification: { ...parsed.notification, registrationDeadline: null },
     action: { ...parsed.action, deadline: null, remindAt: null }, warnings: ['请手动补齐待办截止时间'],
   } }));
-  await page.goto('/');
+  await page.goto('/parse');
   await page.getByLabel('通知原文').fill('本周四晚20:00开展青马学堂线下分享会。');
   await page.getByRole('button', { name: '智能解析', exact: true }).click();
   await expect(page.getByLabel('待办截止时间（必填）')).toHaveValue('');
@@ -77,7 +77,7 @@ test('缺失截止时间时要求补齐，拒绝把活动开始直接保存为�
 test('解析失败保留原文和草稿，不写入真实记录，页面明确显示未验证', async ({ page }) => {
   await page.route('**/api/health', (route) => route.fulfill({ json: { configured: false, realParseVerified: false } }));
   await page.route('**/api/parse', (route) => route.fulfill({ status: 503, json: { error: { code: 'AI_NOT_CONFIGURED', message: '真实解析尚未验证：服务端尚未配置模型密钥。' } } }));
-  await page.goto('/');
+  await page.goto('/parse');
   await expect(page.getByRole('status').first()).toContainText('真实解析尚未验证');
   await page.getByLabel('通知原文').fill(notice);
   await page.getByRole('button', { name: '智能解析', exact: true }).click();
@@ -91,7 +91,7 @@ test('解析失败保留原文和草稿，不写入真实记录，页面明确�
 test('手机宽度下可填写与核对，无横向溢出', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.route('**/api/parse', (route) => route.fulfill({ json: parsed }));
-  await page.goto('/');
+  await page.goto('/parse');
   await page.getByLabel('通知原文').fill(notice);
   await page.getByRole('button', { name: '智能解析', exact: true }).click();
   await expect(page.getByRole('dialog')).toBeVisible();
@@ -101,7 +101,7 @@ test('手机宽度下可填写与核对，无横向溢出', async ({ page }) => 
 
 test('浏览器存储失败时保留确认表单，不误报待办已保存', async ({ page }) => {
   await page.route('**/api/parse', (route) => route.fulfill({ json: parsed }));
-  await page.goto('/');
+  await page.goto('/parse');
   await page.evaluate(() => {
     const originalSetItem = Storage.prototype.setItem;
     Storage.prototype.setItem = function (key, value) {
@@ -129,7 +129,7 @@ for (const [code, message] of [
       requests++;
       return route.fulfill({ status: 502, json: { error: { code, message } } });
     });
-    await page.goto('/');
+    await page.goto('/parse');
     await page.getByLabel('通知原文').fill(competitionRequest.text);
     await page.getByRole('button', { name: '智能解析', exact: true }).click();
     await expect(page.getByRole('alert').first()).toHaveText(message);
@@ -149,7 +149,7 @@ test('完整竞赛示例解析后进入核对，日期占位词需要人工补�
     action: { title: '组队并完成报名', deadline: null, remindAt: null },
     warnings: ['截止时间原文「报名截止日 23:59」缺少明确完整的日期或时间，请手动补齐。', '活动时间原文「竞赛当天上午9:00」缺少明确完整的日期或时间，请手动补齐。'],
   } }));
-  await page.goto('/');
+  await page.goto('/parse');
   await page.getByLabel('通知参考日期').fill(competitionRequest.referenceDate);
   await page.getByLabel('通知原文').fill(competitionRequest.text);
   await page.getByRole('button', { name: '智能解析', exact: true }).click();

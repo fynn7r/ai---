@@ -3,7 +3,8 @@
  * @description 应用路由配置入口
  * 定义了整个应用的页面路由结构，所有页面都嵌套在 Layout 布局组件内。
  * 路由列表：
- * - /          通知解析首页（ParsePage）
+ * - /          工作台首页（WorkbenchPage）——概览与全部入口
+ * - /parse     通知解析（ParsePage）
  * - /generator 通知生成器（GeneratorPage）
  * - /rules     综测加分规则管理（RulesPage）
  * - /reminders 提醒事项列表（RemindersPage）
@@ -16,6 +17,7 @@ import { Routes, Route } from 'react-router-dom';
 import { Layout } from '@/components/Layout';
 import { AuthProvider } from '@/hooks/useAuth';
 import NotFoundPage from '@/pages/NotFoundPage/NotFoundPage';
+import WorkbenchPage from '@/pages/WorkbenchPage/WorkbenchPage';
 import ParsePage from '@/pages/ParsePage/ParsePage';
 import RulesPage from '@/pages/RulesPage/RulesPage';
 import RemindersPage from '@/pages/RemindersPage/RemindersPage';
@@ -29,7 +31,8 @@ export default function App() {
     <AuthProvider>
       <Routes>
         <Route element={<Layout />}>
-          <Route index element={<ParsePage />} />
+          <Route index element={<WorkbenchPage />} />
+          <Route path="parse" element={<ParsePage />} />
           <Route path="generator" element={<GeneratorPage />} />
           <Route path="rules" element={<RulesPage />} />
           <Route path="reminders" element={<RemindersPage />} />

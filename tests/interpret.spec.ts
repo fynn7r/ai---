@@ -32,7 +32,7 @@ test('深度解读使用本地接口，等待时禁止重复点击，显示原�
     await pending;
     await route.fulfill({ json: result });
   });
-  await page.goto('/');
+  await page.goto('/parse');
   await page.getByRole('button', { name: 'AI 解读', exact: true }).click();
   await expect(page.getByRole('button', { name: '解读中', exact: true })).toBeDisabled();
   release();
@@ -52,7 +52,7 @@ for (const [code, message] of [
   test(`${code} 解读失败保留原文、解析结果与历史，不自动重试`, async ({ page }) => {
     let calls = 0;
     await page.route('**/api/interpret', (route) => { calls++; return route.fulfill({ status: 502, json: { error: { code, message } } }); });
-    await page.goto('/');
+    await page.goto('/parse');
     await page.getByRole('button', { name: 'AI 解读', exact: true }).click();
     await expect(page.getByRole('alert').first()).toHaveText(message);
     await expect(page.getByText('青马学堂', { exact: true }).first()).toBeVisible();
@@ -65,7 +65,7 @@ for (const [code, message] of [
 
 test('解读接口返回无效结构不当作成功，不保存空解读', async ({ page }) => {
   await page.route('**/api/interpret', (route) => route.fulfill({ json: { ...result, interpretation_items: [] } }));
-  await page.goto('/');
+  await page.goto('/parse');
   await page.getByRole('button', { name: 'AI 解读', exact: true }).click();
   await expect(page.getByRole('alert').first()).toContainText('深度解读格式无效');
   await expect(page.getByText('原文依据：不报名无法入场', { exact: true })).not.toBeVisible();

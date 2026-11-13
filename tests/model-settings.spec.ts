@@ -93,7 +93,7 @@ test('余额鉴权失败不显示假额度，兼容服务提供控制台入口',
 });
 
 test('解析页与生成页均提供模型入口', async ({ page }) => {
-  for (const url of ['/', '/generator']) {
+  for (const url of ['/parse', '/generator']) {
     await page.goto(url);
     await expect(page.getByRole('link', { name: '配置模型 / 查看额度', exact: true })).toHaveAttribute('href', '/profile#model-access');
   }
