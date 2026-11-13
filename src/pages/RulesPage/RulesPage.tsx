@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { toast } from 'sonner';
 import { capabilityClient } from '@lark-apaas/client-toolkit-lite';
@@ -20,6 +20,7 @@ import {
   Check,
   Link as LinkIcon,
   Lightbulb,
+  Database,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -55,6 +56,7 @@ import {
 import { useLibrary } from '@/hooks/useLibrary';
 import { useAuth } from '@/hooks/useAuth';
 import type { Scope } from '@/lib/knowledge-api';
+import { fetchStorageInfo, type StorageInfo } from '@/lib/knowledge-api';
 import { useGoals } from '@/hooks/useGoals';
 import { PLUGIN_DOC_PARSER } from '@/lib/plugin-instances';
 import type { RuleDocumentParserOneOutput } from '@shared/plugin-types';
@@ -70,6 +72,13 @@ import RuleDocumentEditor, { cleanRuleHtml } from '@/components/RuleDocumentEdit
 import { saveRuleLayout, getRuleLayout, deleteRuleLayout, type StoredRuleLayout } from '@/lib/rule-layout-storage';
 import { genId } from '@/lib/utils';
 
+/** 数据库体积：不到 1 MB 就写 KB，避免出现 0.1 MB 这种看不出量级的数字。 */
+function formatBytes(bytes: number | null) {
+  if (bytes === null || !Number.isFinite(bytes)) return '';
+  if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
 export default function RulesPage() {
   const { user, logout } = useAuth();
   const navigate = useNavigate();
@@ -79,6 +88,22 @@ export default function RulesPage() {
     canWrite, remote, error: libraryError, refresh: refreshLibrary,
   } = useLibrary(scope);
   const { goals, addGoal, removeGoal, loading: goalsLoading } = useGoals();
+
+  const [storageInfo, setStorageInfo] = useState<StorageInfo | null>(null);
+
+  // 知识库落在本机 SQLite 上。把真实文件位置读出来显示，
+  // 用户就不用去猜「这些规则到底存哪了、有没有被传走」。
+  useEffect(() => {
+    if (!remote) {
+      setStorageInfo(null);
+      return;
+    }
+    let cancelled = false;
+    void fetchStorageInfo()
+      .then((info) => { if (!cancelled) setStorageInfo(info); })
+      .catch(() => { /* 读不到就不显示，不影响页面其余功能 */ });
+    return () => { cancelled = true; };
+  }, [remote]);
 
   const [textInput, setTextInput] = useState('');
   const [titleInput, setTitleInput] = useState('');
@@ -453,6 +478,16 @@ export default function RulesPage() {
                   ? `已登录：${user?.displayName}（${user?.role === 'admin' ? '管理员' : '普通用户'}）`
                   : '当前未登录，下面是本机旧规则库；登录后可选择迁移到你的个人知识库。'}
               </p>
+              {storageInfo && (
+                <p className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
+                  <Database className="size-3.5 shrink-0" />
+                  <span>存在本机</span>
+                  <code className="max-w-full break-all rounded bg-muted px-1.5 py-0.5 font-mono text-[11px]">
+                    {storageInfo.dbPath ?? storageInfo.dir}
+                  </code>
+                  {storageInfo.bytes !== null && <span>{formatBytes(storageInfo.bytes)}</span>}
+                </p>
+              )}
             </div>
             {remote ? (
               <Button

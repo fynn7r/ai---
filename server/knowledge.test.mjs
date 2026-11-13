@@ -146,6 +146,22 @@ describe('双知识库：账号、隔离与检索', () => {
     assert.equal(res.status, 401);
   });
 
+  it('存储位置接口要登录，且指回这台机器上的数据库文件', async () => {
+    const anonymous = makeClient(server);
+    const denied = await anonymous.call('GET', '/api/storage/info');
+    assert.equal(denied.status, 401, '未登录不该拿到文件路径');
+
+    const client = makeClient(server);
+    const login = await client.call('POST', '/api/auth/login', { username: 'alice', password: 'alice-password-123' });
+    assert.equal(login.status, 200);
+    const info = await client.call('GET', '/api/storage/info');
+    assert.equal(info.status, 200, info.text);
+    assert.equal(info.body.kind, 'sqlite');
+    assert.equal(info.body.local, true);
+    assert.equal(info.body.dbPath, join(tmp, 'knowledge.db'), '报告的路径必须就是实际打开的库文件');
+    assert.ok(info.body.bytes > 0, '库文件应当已有内容');
+  });
+
   it('A 的个人资料 B 读不到、改不了，列表也不出现', async () => {
     const alice = makeClient(server);
     await alice.call('POST', '/api/auth/login', { username: 'alice', password: 'alice-password-123' });

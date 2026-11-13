@@ -6,7 +6,13 @@ import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { resolve } from 'node:path';
 
-export const SCHEMA_VERSION = 2;
+/**
+ * 2 → 3：reminders 增加 revision 列。
+ * 加它是因为「内存权威 + 非阻塞写」在多端同时编辑时是静默覆盖：
+ * 宿舍改标题、家里改截止，后写的把先写的吃掉，谁也不知道丢了一条。
+ * 带版本号的条件更新能把这种情况变成一次明确的 409。
+ */
+export const SCHEMA_VERSION = 3;
 
 export function nowIso() {
   return new Date().toISOString();
@@ -109,11 +115,23 @@ CREATE TABLE IF NOT EXISTS reminders (
   payload             TEXT NOT NULL DEFAULT '{}',
   created_at          TEXT NOT NULL,
   updated_at          TEXT NOT NULL,
-  deleted_at          TEXT
+  deleted_at          TEXT,
+  revision            INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_reminders_owner
   ON reminders(owner_id, deleted_at, completed, deadline);
 `;
+
+/**
+ * 建表语句都是 IF NOT EXISTS，老库不会自动长出新增的列。
+ * 这里按 PRAGMA 结果补列：只做 ADD COLUMN，不重建表，历史数据原样保留。
+ */
+function ensureColumn(db, table, column, definition) {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all();
+  if (columns.some((item) => item.name === column)) return false;
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${definition}`);
+  return true;
+}
 
 /**
  * 打开知识库。FTS5 表单独创建：部分构建可能不支持，届时检索降级为 LIKE。
@@ -127,6 +145,7 @@ export function openKnowledgeDb({ dir }) {
   db.exec('PRAGMA busy_timeout = 5000');
   db.exec('PRAGMA foreign_keys = ON');
   db.exec(DDL);
+  ensureColumn(db, 'reminders', 'revision', 'revision INTEGER NOT NULL DEFAULT 1');
 
   let ftsEnabled = true;
   try {
@@ -148,6 +167,9 @@ export function openKnowledgeDb({ dir }) {
   return {
     db,
     dir: root,
+    // 数据库文件的实际位置。对外只通过 /api/storage/info 暴露，用于向用户证明
+    // 知识库落在这台机器的磁盘上，而不是某个远端服务。
+    dbPath: resolve(root, 'knowledge.db'),
     ftsEnabled,
     close() {
       try { db.close(); } catch { /* 已关闭 */ }

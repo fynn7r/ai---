@@ -8,6 +8,7 @@ import { createEnvSettingsStore, publicAiSettings, requireLocalSettingsRequest, 
 import { extractRuleDocument } from './rule-document-service.mjs';
 import { extractWechatArticle } from './article-extract.mjs';
 import { visionConfiguration } from './vision-service.mjs';
+import { ocrImages, OCR_MAX_TOTAL_BYTES } from './ocr-service.mjs';
 import { createStaticHandler } from './static-server.mjs';
 import { MAX_DOCUMENT_BYTES } from '../shared/rule-document-contract.ts';
 import { createKnowledgeRouter, getSessionUser } from './knowledge/http.mjs';
@@ -19,6 +20,12 @@ export function createApiServer(config = configuration(), fetchImpl = fetch, set
   const knowledgeRouter = knowledgeStore ? createKnowledgeRouter({ store: knowledgeStore }) : null;
   // 传入构建目录时，同一端口同时提供前端与 API，避免普通用户维护两个进程。
   const staticHandler = staticDir ? createStaticHandler(staticDir) : null;
+  // 文章配图与本地截图共用一套视觉配置：密钥和地址跟随当前生效的模型，模型名单独由 AI_VISION_MODEL 指定。
+  const visionConfigOf = (config) => visionConfiguration({
+    ...process.env,
+    AI_API_KEY: config.apiKey,
+    AI_BASE_URL: config.baseUrl,
+  });
   return createServer(async (request, response) => {
     response.setHeader('Content-Type', 'application/json; charset=utf-8');
     response.setHeader('Cache-Control', 'no-store');
@@ -33,6 +40,7 @@ export function createApiServer(config = configuration(), fetchImpl = fetch, set
       if (knowledgeRouter && (
         pathname.startsWith('/api/auth/')
         || pathname.startsWith('/api/knowledge/')
+        || pathname === '/api/storage/info'
         || pathname === '/api/reminders'
         || pathname.startsWith('/api/reminders/')
       )) {
@@ -52,33 +60,52 @@ export function createApiServer(config = configuration(), fetchImpl = fetch, set
         send(200, await (pathname === '/api/ai/models' ? listAiModels : getAiBalance)(activeConfig, fetchImpl));
         return;
       }
-      if (!['/api/parse', '/api/generate', '/api/interpret', '/api/rules/import', '/api/article', '/api/ai/settings'].includes(pathname) || request.method !== 'POST') {
+      if (!['/api/parse', '/api/generate', '/api/interpret', '/api/rules/import', '/api/article', '/api/ocr', '/api/ai/settings'].includes(pathname) || request.method !== 'POST') {
         send(404, { error: { code: 'NOT_FOUND', message: '接口不存在' } });
         return;
       }
       const importingDocument = pathname === '/api/rules/import';
-      if (!request.headers['content-type']?.startsWith(importingDocument ? 'multipart/form-data' : 'application/json')) {
-        throw new ApiError(415, 'INVALID_CONTENT_TYPE', importingDocument ? '请使用文件上传方式提交规则文档。' : '请使用 JSON 提交通知。');
+      const uploadingImages = pathname === '/api/ocr';
+      const acceptsUpload = importingDocument || uploadingImages;
+      if (!request.headers['content-type']?.startsWith(acceptsUpload ? 'multipart/form-data' : 'application/json')) {
+        throw new ApiError(415, 'INVALID_CONTENT_TYPE', importingDocument
+          ? '请使用文件上传方式提交规则文档。'
+          : uploadingImages ? '请使用文件上传方式提交图片。' : '请使用 JSON 提交通知。');
       }
+      // 图片只能走 multipart，正文上限要按图片体积另算；其余接口维持 256 KB。
+      const bodyLimit = importingDocument
+        ? MAX_DOCUMENT_BYTES + 64 * 1024
+        : uploadingImages ? OCR_MAX_TOTAL_BYTES + 64 * 1024 : 256 * 1024;
       const chunks = [];
       let size = 0;
       for await (const chunk of request) {
         size += chunk.length;
-        if (size > (importingDocument ? MAX_DOCUMENT_BYTES + 64 * 1024 : 256 * 1024)) throw new ApiError(413, 'REQUEST_TOO_LARGE', '请求内容过大。');
+        if (size > bodyLimit) {
+          throw new ApiError(413, 'REQUEST_TOO_LARGE', uploadingImages
+            ? `图片总大小超过 ${Math.round(OCR_MAX_TOTAL_BYTES / 1024 / 1024)} MB 上限，请压缩或分次上传。` : '请求内容过大。');
+        }
         chunks.push(chunk);
       }
-      if (importingDocument) {
+      if (acceptsUpload) {
         let form;
         try {
-          form = await new Request('http://localhost/api/rules/import', {
+          form = await new Request(`http://localhost${pathname}`, {
             method: 'POST', headers: { 'Content-Type': request.headers['content-type'] },
             body: Buffer.concat(chunks),
           }).formData();
-        } catch { throw new ApiError(400, 'INVALID_DOCUMENT_UPLOAD', '文件上传内容无效，请重新选择文件。'); }
-        const files = form.getAll('file');
-        const file = files[0];
-        if (files.length !== 1 || !(file instanceof File)) throw new ApiError(400, 'INVALID_DOCUMENT_UPLOAD', '请每次上传一个规则文件。');
-        send(200, await extractRuleDocument(file.name, Buffer.from(await file.arrayBuffer())));
+        } catch {
+          throw new ApiError(400, uploadingImages ? 'INVALID_IMAGE_UPLOAD' : 'INVALID_DOCUMENT_UPLOAD',
+            uploadingImages ? '图片上传内容无效，请重新选择图片。' : '文件上传内容无效，请重新选择文件。');
+        }
+        const files = form.getAll('file').filter((item) => item instanceof File);
+        if (importingDocument) {
+          if (files.length !== 1) throw new ApiError(400, 'INVALID_DOCUMENT_UPLOAD', '请每次上传一个规则文件。');
+          send(200, await extractRuleDocument(files[0].name, Buffer.from(await files[0].arrayBuffer())));
+          return;
+        }
+        const uploads = [];
+        for (const file of files) uploads.push({ name: file.name, buffer: Buffer.from(await file.arrayBuffer()) });
+        send(200, await ocrImages(uploads, visionConfigOf(activeConfig), fetchImpl));
         return;
       }
       let input;
@@ -92,13 +119,7 @@ export function createApiServer(config = configuration(), fetchImpl = fetch, set
         return;
       }
       if (pathname === '/api/article') {
-        // 密钥与地址跟随当前生效的模型配置，视觉模型名单独由 AI_VISION_MODEL 指定。
-        const visionConfig = visionConfiguration({
-          ...process.env,
-          AI_API_KEY: activeConfig.apiKey,
-          AI_BASE_URL: activeConfig.baseUrl,
-        });
-        send(200, await extractWechatArticle(input?.url, { fetchImpl, visionConfig }));
+        send(200, await extractWechatArticle(input?.url, { fetchImpl, visionConfig: visionConfigOf(activeConfig) }));
         return;
       }
       const service = pathname === '/api/generate' ? generateNotification : pathname === '/api/interpret' ? interpretNotification : parseNotification;

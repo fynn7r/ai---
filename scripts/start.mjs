@@ -98,10 +98,21 @@ async function main() {
   const { createApiServer } = await import('../server/index.mjs');
 
   const settingsStore = createEnvSettingsStore(ENV_FILE);
-  const knowledgeStore = openKnowledgeDb({ dir: process.env.KNOWLEDGE_STORE || resolve(ROOT, '.local/knowledge') });
-  const createdAdmin = await ensureAdmin(knowledgeStore);
+
+  /**
+   * 知识库（账号 + 待办 + 规则）是本地 SQLite。
+   * 托管到只给一个 HTTP 端口的沙箱时，用 `KNOWLEDGE=off` 直接不建库：
+   * 不带上这条链路，就不用担心重启后文件是不是还在。
+   */
+  const knowledgeEnabled = String(process.env.KNOWLEDGE ?? 'on').toLowerCase() !== 'off';
+  const knowledgeStore = knowledgeEnabled
+    ? openKnowledgeDb({ dir: process.env.KNOWLEDGE_STORE || resolve(ROOT, '.local/knowledge') })
+    : null;
+  const createdAdmin = knowledgeStore ? await ensureAdmin(knowledgeStore) : null;
 
   const port = Number(process.env.PORT) || Number(process.env.WEB_PORT) || 8001;
+  // 托管平台只给一个对外端口，必须绑 0.0.0.0；本机自用仍绑回环，不对局域网开放。
+  const host = process.env.HOST || (process.env.PORT ? '0.0.0.0' : '127.0.0.1');
   const server = createApiServer(settingsStore.getConfig(), fetch, settingsStore, knowledgeStore, DIST_DIR);
 
   server.on('error', (error) => {
@@ -111,8 +122,8 @@ async function main() {
     fail(error.message);
   });
 
-  server.listen(port, '127.0.0.1', () => {
-    const url = `http://127.0.0.1:${port}`;
+  server.listen(port, host, () => {
+    const url = `http://${host === '0.0.0.0' ? '127.0.0.1' : host}:${port}`;
     log('');
     log('  通知智析已启动');
     log(`  访问地址：${url}`);
@@ -138,7 +149,7 @@ async function main() {
   const shutdown = () => {
     log('\n正在停止服务…');
     server.close(() => {
-      try { knowledgeStore.close(); } catch { /* 已关闭 */ }
+      try { knowledgeStore?.close(); } catch { /* 已关闭 */ }
       process.exit(0);
     });
     // 兜底：连接迟迟不释放时强制退出，避免按 Ctrl+C 无反应。

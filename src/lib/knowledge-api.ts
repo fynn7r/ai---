@@ -55,10 +55,13 @@ export function setCsrfToken(value: string | null) {
 export class ApiFailure extends Error {
   code: string;
   status: number;
-  constructor(status: number, code: string, message: string) {
+  /** 服务端错误体里的附加信息，例如版本冲突时的 current 副本。 */
+  details?: Record<string, unknown>;
+  constructor(status: number, code: string, message: string, details?: Record<string, unknown>) {
     super(message);
     this.status = status;
     this.code = code;
+    this.details = details;
   }
 }
 
@@ -77,8 +80,13 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   let payload: unknown = null;
   try { payload = await response.json(); } catch { /* 空响应 */ }
   if (!response.ok) {
-    const error = (payload as { error?: { code?: string; message?: string } } | null)?.error;
-    throw new ApiFailure(response.status, error?.code ?? 'UNKNOWN', error?.message ?? '请求失败，请重试。');
+    const error = (payload as { error?: { code?: string; message?: string; current?: unknown } } | null)?.error;
+    throw new ApiFailure(
+      response.status,
+      error?.code ?? 'UNKNOWN',
+      error?.message ?? '请求失败，请重试。',
+      error?.current ? { current: error.current } : undefined,
+    );
   }
   return payload as T;
 }
@@ -119,6 +127,20 @@ export async function listEntries(scope: Scope) {
   return request<{ scope: Scope; canWrite: boolean; entries: KnowledgeEntry[] }>(
     `/api/knowledge/entries?scope=${scope}`,
   );
+}
+
+/** 本机数据库位置。用于在界面上如实标明「数据存在自己电脑上」。 */
+export interface StorageInfo {
+  kind: string;
+  local: boolean;
+  dir: string;
+  dbPath: string | null;
+  bytes: number | null;
+  ftsEnabled: boolean;
+}
+
+export async function fetchStorageInfo() {
+  return request<StorageInfo>('/api/storage/info');
 }
 
 export async function getEntry(id: string) {

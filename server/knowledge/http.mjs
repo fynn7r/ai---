@@ -3,6 +3,7 @@
  * 身份只来自服务端会话；body / query / header 里的 userId、role、scope 一律不采信。
  */
 import { KnowledgeError, publicUser, createSession, resolveSession, revokeSession, login, consumeInvite, createInvite, listInvites, createRateLimiter, countUsers } from './auth.mjs';
+import { statSync } from 'node:fs';
 import { createEntry, updateEntry, deleteEntry, getEntry, listEntries, listChunks, countEntries, recordLegacyImport, findLegacyImport } from './store.mjs';
 import { retrieveContext, buildKnowledgeContext, publicCitations } from './search.mjs';
 import { ReminderError, deleteReminder, importLocalReminders, listForExport, listReminders, patchReminder, upsertReminder } from './reminders-store.mjs';
@@ -220,6 +221,29 @@ export function createKnowledgeRouter({ store, secureCookies = false, sessionTtl
       return true;
     }
 
+    // ── 存储位置（本地 SQLite） ───────────────────────────
+    // 只读接口。作用是让界面能直接显示「数据存在这台机器的哪个文件」，
+    // 而不是让用户靠文档猜测，或误以为知识库被传到了某个云端。
+    if (pathname === '/api/storage/info' && method === 'GET') {
+      requireUser(request);
+      const dbPath = store.dbPath ?? null;
+      let bytes = null;
+      try {
+        bytes = dbPath ? statSync(dbPath).size : null;
+      } catch {
+        // 文件刚创建或已被外部移走：体积留空，不影响其余信息
+      }
+      sendJson(response, 200, {
+        kind: 'sqlite',
+        local: true,
+        dir: store.dir,
+        dbPath,
+        bytes,
+        ftsEnabled: Boolean(store.ftsEnabled),
+      });
+      return true;
+    }
+
     // ── 知识条目 ─────────────────────────────────────────
     if (pathname === '/api/knowledge/entries' && method === 'GET') {
       const { user } = requireUser(request);
@@ -421,13 +445,18 @@ export function createKnowledgeRouter({ store, secureCookies = false, sessionTtl
         const { user, session } = requireUser(request);
         requireCsrf(request, session);
         const body = await readJson(request);
-        sendJson(response, 200, { reminder: patchReminder(db, user.id, id, body) });
+        const expectedRevision = body?.expectedRevision;
+        sendJson(response, 200, {
+          reminder: patchReminder(db, user.id, id, body, { expectedRevision }),
+        });
         return true;
       }
       if (method === 'DELETE') {
         const { user, session } = requireUser(request);
         requireCsrf(request, session);
-        sendJson(response, 200, deleteReminder(db, user.id, id));
+        sendJson(response, 200, deleteReminder(db, user.id, id, {
+          expectedRevision: url.searchParams.get('revision'),
+        }));
         return true;
       }
     }
@@ -448,7 +477,15 @@ export function createKnowledgeRouter({ store, secureCookies = false, sessionTtl
           return true;
         }
         if (error instanceof ReminderError) {
-          sendJson(response, error.status, { error: { code: error.code, message: error.message } });
+          // 版本冲突要带上服务端当前副本，否则客户端只有一句「被改过」，
+          // 用户既看不到另一台改成了什么，也没法据此决定保留哪一份。
+          sendJson(response, error.status, {
+            error: {
+              code: error.code,
+              message: error.message,
+              ...(error.current ? { current: error.current } : {}),
+            },
+          });
           return true;
         }
         console.error('[knowledge] 未预期错误：', error?.message);
