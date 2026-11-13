@@ -53,29 +53,34 @@ function parseModelJson(raw) {
   return null;
 }
 
-function normalizeItems(items, batch) {
+/**
+ * @param {{maxTextChars?: number, preserveLines?: boolean}} options
+ *   preserveLines 用于本地截图 OCR：换行是版面信息的一部分，压成一行会丢掉
+ *   「第一行是主题、第二行是时间」这类结构；公众号配图回填正文则必须单行。
+ */
+function normalizeItems(items, batch, { maxTextChars = 1500, preserveLines = false } = {}) {
   const byIndex = new Map();
   for (const item of items) {
     const index = Number(item?.index);
     if (!Number.isInteger(index) || !batch.some((entry) => entry.index === index)) continue;
     const kind = ['info', 'deco', 'qr', 'other'].includes(item?.kind) ? item.kind : 'other';
-    // 誊抄文字要压成单行，否则回填后 [图片 N：…] 会跨行，破坏正文结构；
     // 半角方括号换成全角，避免与占位符标记自身的括号混淆。
-    const text = typeof item?.text === 'string'
-      ? item.text
-        .replace(/\s+/g, ' ')
-        .replace(/\[/g, '［')
-        .replace(/\]/g, '］')
-        .trim()
-        .slice(0, 1500)
-      : '';
+    let text = '';
+    if (typeof item?.text === 'string') {
+      const raw = item.text.replace(/\r\n?/g, '\n');
+      text = (preserveLines
+        ? raw.replace(/[ \t\u00a0]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim()
+        : raw.replace(/\s+/g, ' ').trim()
+      ).replace(/\[/g, '［').replace(/\]/g, '］').slice(0, maxTextChars);
+    }
     byIndex.set(index, { index, kind, text });
   }
   return byIndex;
 }
 
-async function readBatch(batch, config, fetchImpl) {
-  const content = [{ type: 'text', text: `${PROMPT_HEAD}\n本批共 ${batch.length} 张。` }];
+async function readBatch(batch, config, fetchImpl, options = {}) {
+  const prompt = options.prompt || PROMPT_HEAD;
+  const content = [{ type: 'text', text: `${prompt}\n本批共 ${batch.length} 张。` }];
   for (const entry of batch) {
     content.push({ type: 'text', text: `【图片 ${entry.index}】` });
     content.push({ type: 'image_url', image_url: { url: entry.url } });
@@ -99,15 +104,17 @@ async function readBatch(batch, config, fetchImpl) {
   const raw = payload?.choices?.[0]?.message?.content;
   const items = parseModelJson(typeof raw === 'string' ? raw : '');
   if (!items) throw new Error('视觉模型返回的内容不是预期的 JSON 结构');
-  return normalizeItems(items, batch);
+  return normalizeItems(items, batch, options);
 }
 
 /**
  * 识别若干张图片。并发分两批上限，单批失败只影响该批。
  * @param {{index: number, url: string}[]} entries
+ * @param {{prompt?: string, maxTextChars?: number, preserveLines?: boolean}} options
+ *   本地截图 OCR 用自定义 prompt 与 preserveLines，公众号配图沿用默认值。
  * @returns {Promise<{results: Map<number, {index: number, kind: string, text: string}>, warnings: string[]}>}
  */
-export async function readImages(entries, config, fetchImpl = fetch) {
+export async function readImages(entries, config, fetchImpl = fetch, options = {}) {
   const results = new Map();
   const warnings = [];
   if (!entries.length) return { results, warnings };
@@ -123,7 +130,7 @@ export async function readImages(entries, config, fetchImpl = fetch) {
   let failedBatches = 0;
   for (const batch of batches) {
     try {
-      const parsed = await readBatch(batch, config, fetchImpl);
+      const parsed = await readBatch(batch, config, fetchImpl, options);
       for (const entry of batch) {
         // 模型漏答的图片按未识别处理，不臆造内容。
         results.set(entry.index, parsed.get(entry.index) ?? { index: entry.index, kind: 'other', text: '' });

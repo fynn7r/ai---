@@ -1,4 +1,4 @@
-import { useState, useCallback, useMemo, useEffect, useRef, type ChangeEvent } from 'react';
+import { useState, useCallback, useMemo, useEffect, useRef, type ChangeEvent, type ClipboardEvent } from 'react';
 import { toast } from 'sonner';
 import { capabilityClient, logger } from '@lark-apaas/client-toolkit-lite';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -12,6 +12,7 @@ import {
   ChevronDown,
   FilePlus,
   Paperclip,
+  ImagePlus,
   Link2,
   Trash2,
   X,
@@ -50,11 +51,13 @@ import ReminderConfirmation, { type ConfirmedReminder } from '@/components/parse
 import { IS_STANDALONE, parseWithApi } from '@/lib/parse-api';
 import { fetchWechatArticle, findWechatArticleUrls, isWechatArticleUrl, type IArticleImage } from '@/lib/article-api';
 import { readDocumentText } from '@/lib/rule-document-api';
+import { ocrImages } from '@/lib/ocr-api';
 import { genId } from '@/lib/utils';
 import { interpretWithApi } from '@/lib/interpret-api';
-import { Link } from 'react-router-dom';
+import { Link, useLocation } from 'react-router-dom';
 import { DEFAULT_TIMEZONE, dateInTimezone } from '@shared/date-time';
 import { MAX_NOTIFICATION_CHARS } from '@shared/limits';
+import { OCR_MAX_FILES } from '@shared/ocr-contract';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import ImportanceBadge from '@/components/common/ImportanceBadge';
@@ -126,8 +129,9 @@ const MATERIAL_BUDGET = MAX_NOTIFICATION_CHARS;
 
 interface IMaterial {
   id: string;
-  kind: 'file' | 'link';
-  /** 文件用文件名，链接用原始 URL，用来避免重复抓取同一篇文章。 */
+  /** file=文档，link=公众号文章，image=本机截图经视觉模型识别出的文字 */
+  kind: 'file' | 'link' | 'image';
+  /** 文件用文件名，链接用原始 URL，图片用文件名+序号，用来避免重复加入同一份材料。 */
   source: string;
   label: string;
   text: string;
@@ -174,6 +178,19 @@ export default function ParsePage() {
   const [apiStatus, setApiStatus] = useState('真实解析尚未验证：正在检查本地解析服务。');
   const [parseError, setParseError] = useState('');
   const [impliedError, setImpliedError] = useState('');
+
+  /**
+   * 工作台首屏可以直接贴通知，文本通过路由 state 带过来。
+   * 只认第一次进入时的那一份：之后再从别处跳回本页，不能把用户后来改的字覆盖掉。
+   */
+  const location = useLocation();
+  const prefillApplied = useRef(false);
+  const prefillText = (location.state as { text?: string } | null)?.text ?? '';
+  useEffect(() => {
+    if (!prefillText || prefillApplied.current) return;
+    prefillApplied.current = true;
+    setInputText((current) => (current.trim() ? current : prefillText));
+  }, [prefillText]);
 
   useEffect(() => {
     if (!IS_STANDALONE) return;
@@ -237,7 +254,9 @@ export default function ParsePage() {
   const [supplementsExpanded, setSupplementsExpanded] = useState(true);
   const [materials, setMaterials] = useState<IMaterial[]>([]);
   const [attaching, setAttaching] = useState(false);
+  const [recognizing, setRecognizing] = useState(false);
   const materialInputRef = useRef<HTMLInputElement>(null);
+  const imageInputRef = useRef<HTMLInputElement>(null);
 
   const addMaterials = useCallback((incoming: IMaterial[]) => {
     if (incoming.length === 0) return;
@@ -269,6 +288,59 @@ export default function ParsePage() {
       setAttaching(false);
     }
   }, [addMaterials]);
+
+  /**
+   * 图片先过一次视觉模型，把图里的文字抄成一份材料再加进去。
+   * 之所以不把图片直接塞进解析请求：识别结果要能让人核对和修改，
+   * 「模型看错了字」和「模型理解错了」是两类问题，得分开暴露。
+   */
+  const recognizeImages = useCallback(async (picked: File[]) => {
+    if (picked.length === 0) return;
+    const batch = picked.slice(0, OCR_MAX_FILES);
+    if (picked.length > batch.length) {
+      toast.message(`一次最多识别 ${OCR_MAX_FILES} 张，先处理前 ${OCR_MAX_FILES} 张。`);
+    }
+    setRecognizing(true);
+    try {
+      const result = await ocrImages(batch);
+      const read = result.items.filter((item) => item.kind === 'text' && item.text.trim());
+      if (read.length === 0) {
+        toast.error(result.warnings[0] || '这些图片都没读到文字，请重新截图或直接粘贴文字。');
+        return;
+      }
+      addMaterials(read.map((item) => ({
+        id: genId('material'),
+        kind: 'image' as const,
+        source: `image:${item.name}:${item.index}:${Date.now()}`,
+        label: item.name,
+        text: item.text,
+        chars: item.text.length,
+      })));
+      const blank = result.items.length - read.length;
+      toast.success(`已识别 ${read.length} 张图片的文字${blank > 0 ? `，${blank} 张没读到字` : ''}`);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : '图片识别失败，请重试。');
+    } finally {
+      setRecognizing(false);
+    }
+  }, [addMaterials]);
+
+  const handlePickImages = useCallback(async (event: ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files ?? []);
+    event.target.value = '';
+    await recognizeImages(files);
+  }, [recognizeImages]);
+
+  /** 截图直接 Ctrl+V：从微信、QQ、系统截图工具粘贴过来的都是 image/* 的 File。 */
+  const handlePasteImages = useCallback((event: ClipboardEvent<HTMLTextAreaElement>) => {
+    const clipboard = event.clipboardData;
+    if (!clipboard) return;
+    const images = Array.from(clipboard.files ?? []).filter((file) => file.type.startsWith('image/'));
+    if (images.length === 0) return;
+    // 剪贴板里同时有文字时保留默认粘贴，只额外处理图片，避免吞掉用户复制的内容。
+    if (!clipboard.getData('text/plain')) event.preventDefault();
+    void recognizeImages(images);
+  }, [recognizeImages]);
 
   // 完整解析 pipeline（字段提取 + 规则匹配 + 重要程度判断）
   const runParsePipeline = useCallback(
@@ -824,13 +896,14 @@ export default function ParsePage() {
                  </div>
                </div>
              )}
-             <Textarea
-               aria-label="通知原文"
-               value={inputText}
-               onChange={handleInputChange}
-               placeholder="粘贴班级群/社区群通知原文，或直接贴微信公众号文章链接..."
-               className="min-h-[160px] resize-y rounded-lg border-border/60 text-sm leading-relaxed focus-visible:ring-1 break-all"
-             />
+            <Textarea
+              aria-label="通知原文"
+              value={inputText}
+              onChange={handleInputChange}
+              onPaste={handlePasteImages}
+              placeholder="粘贴班级群/社区群通知原文，或直接贴微信公众号文章链接；也可以在这里 Ctrl+V 粘贴通知截图..."
+              className="min-h-[160px] resize-y rounded-lg border-border/60 text-sm leading-relaxed focus-visible:ring-1 break-all"
+            />
              {parseError && <p role="alert" className="mt-3 text-sm text-destructive">{parseError}</p>}
              {materials.length > 0 && (
                <div className="mt-3 space-y-2">
@@ -838,8 +911,10 @@ export default function ParsePage() {
                    <div key={material.id} className="flex items-center gap-2 rounded-lg border border-border/60 bg-muted/40 px-3 py-2 text-xs">
                      {material.kind === 'link'
                        ? <Link2 className="size-3.5 shrink-0 text-muted-foreground" />
-                       : <FileText className="size-3.5 shrink-0 text-muted-foreground" />}
-                     <span className="min-w-0 flex-1 truncate" title={material.label}>{material.label}</span>
+                       : material.kind === 'image'
+                         ? <ImagePlus className="size-3.5 shrink-0 text-muted-foreground" />
+                         : <FileText className="size-3.5 shrink-0 text-muted-foreground" />}
+                     <span className="min-w-0 flex-1 truncate" title={material.kind === 'image' ? material.text.slice(0, 300) : material.label}>{material.label}</span>
                      <span className="shrink-0 tabular-nums text-muted-foreground">{material.chars} 字</span>
                      <button
                        type="button"
@@ -851,7 +926,10 @@ export default function ParsePage() {
                      </button>
                    </div>
                  ))}
-                 <p className="text-xs text-muted-foreground">参考材料与通知原文一起送入解析，原文优先，合计上限 {MATERIAL_BUDGET} 字。</p>
+                 <p className="text-xs text-muted-foreground">
+                   参考材料与通知原文一起送入解析，原文优先，合计上限 {MATERIAL_BUDGET} 字。
+                   {materials.some((item) => item.kind === 'image') && '图片里的文字由模型识别，关键时间、地点、金额请对照原图核对。'}
+                 </p>
                </div>
              )}
              {articleImages.length > 0 && (
@@ -917,6 +995,27 @@ export default function ParsePage() {
                   )}
                 </div>
                 <div className="flex items-center gap-2 shrink-0">
+                  <input
+                    ref={imageInputRef}
+                    type="file"
+                    multiple
+                    accept="image/*"
+                    className="hidden"
+                    onChange={handlePickImages}
+                  />
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    type="button"
+                    disabled={recognizing || parsing}
+                    onClick={() => imageInputRef.current?.click()}
+                    title={`上传通知截图或翻拍照片，识别其中的文字（一次最多 ${OCR_MAX_FILES} 张）`}
+                  >
+                    {recognizing
+                      ? <Loader2 className="mr-1.5 size-4 animate-spin" />
+                      : <ImagePlus className="mr-1.5 size-4" />}
+                    {recognizing ? '识别中' : '图片/截图'}
+                  </Button>
                   <input
                     ref={materialInputRef}
                     type="file"
