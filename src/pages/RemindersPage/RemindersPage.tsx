@@ -45,13 +45,20 @@ import ImportanceBadge from '@/components/common/ImportanceBadge';
 import VoiceReminderCreator from '@/components/reminder/VoiceReminderCreator';
 import { formatCountdown, getUrgency, formatDateTime, formatLocalDateTime, getSafeTime, parseSmartDate } from '@/lib/date-utils';
 import { describeSkipped, downloadFromServer, downloadRemindersCsv, downloadRemindersIcs } from '@/lib/export-ics';
-import { useReminderSync, importLocalToServer, dismissPendingImport, retrySync } from '@/lib/reminder-sync';
+import { useReminderSync, importLocalToServer, dismissPendingImport, retrySync, resolveConflict } from '@/lib/reminder-sync';
 import { useAuth } from '@/hooks/useAuth';
-import type { ImportanceLevel } from '@/data/reminder';
+import type { ImportanceLevel, IReminder } from '@/data/reminder';
 import { cn } from '@/lib/utils';
 
 type FilterTab = 'all' | 'pending' | 'completed';
 type SourceFilter = 'all' | 'notification' | 'personal';
+
+/** 冲突两侧的摘要：标题 + 截止时间，一眼能看出两边差在哪。 */
+function describeConflictSide(item: IReminder | null, format: (value: string) => string): string {
+  if (!item) return '已删除';
+  const deadline = item.deadline && getSafeTime(item.deadline) ? format(item.deadline) : '无截止时间';
+  return `${item.title}（${deadline}）`;
+}
 
 export default function RemindersPage() {
   const { reminders, loading, toggleComplete, deleteReminder, addReminder } =
@@ -304,6 +311,37 @@ export default function RemindersPage() {
              </p>
            </div>
            <Button size="sm" variant="outline" onClick={() => void retrySync()}>重试</Button>
+         </div>
+       )}
+
+       {/* 版本冲突：两端都改过同一条，服务端拒绝了覆盖，让用户自己定 */}
+       {sync.conflicts.length > 0 && (
+         <div className="mb-4 rounded-xl border border-destructive/30 bg-destructive/[0.04] p-4 text-sm">
+           <p className="font-medium text-destructive">
+             有 {sync.conflicts.length} 条待办在另一台设备上也被改过
+           </p>
+           <p className="mt-1 text-xs text-muted-foreground">
+             为避免两边互相覆盖，这台设备先停在这里。选一份保留，另一份会被丢弃。
+           </p>
+           <ul className="mt-3 space-y-2">
+             {sync.conflicts.map((conflict) => (
+               <li key={conflict.id} className="rounded-lg border border-border/60 bg-background p-3">
+                 <p className="truncate text-sm font-medium">{conflict.remote.title}</p>
+                 <div className="mt-1 space-y-0.5 text-xs text-muted-foreground">
+                   <p>这台设备：{describeConflictSide(conflict.local, formatDateTime)}</p>
+                   <p>另一台设备：{describeConflictSide(conflict.remote, formatDateTime)}</p>
+                 </div>
+                 <div className="mt-2 flex gap-2">
+                   <Button size="sm" variant="outline" onClick={() => resolveConflict(conflict.id, 'local')}>
+                     保留这台
+                   </Button>
+                   <Button size="sm" variant="outline" onClick={() => resolveConflict(conflict.id, 'remote')}>
+                     用另一台的
+                   </Button>
+                 </div>
+               </li>
+             ))}
+           </ul>
          </div>
        )}
 

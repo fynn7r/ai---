@@ -96,6 +96,7 @@ function fromRow(row) {
     completed: Boolean(row.completed),
     createdAt: extra.createdAt ?? (Date.parse(row.created_at) || Date.now()),
     updatedAt: row.updated_at,
+    revision: Number(row.revision ?? 1),
   };
 }
 
@@ -152,14 +153,25 @@ export function getReminder(db, ownerId, id) {
 /**
  * 新建或整条覆盖。带前端 id 时幂等：同一条待办重复提交不会产生第二行。
  * 已经软删过的 id 再提交时视为「恢复」，把墓碑清掉。
+ *
+ * 关于 `input.revision`：它是**客户端上次看到的版本号**，不是要写进去的值。
+ * 给了就必须与库里一致，否则说明另一台设备在这期间改过——返回 409 并把服务端
+ * 当前副本一起带出去，让用户自己决定保留哪一份，而不是替他把一边悄悄抹掉。
+ * 没给（老客户端、导入迁移）则按原来的覆盖语义走，保持向后兼容。
  */
 export function upsertReminder(db, ownerId, input) {
   const id = assertId(input?.id);
   const title = assertTitle(input?.title);
-  const existing = db.prepare('SELECT owner_id FROM reminders WHERE id = ?').get(id);
+  const existing = db.prepare('SELECT owner_id, revision FROM reminders WHERE id = ?').get(id);
   if (existing && existing.owner_id !== ownerId) {
     throw new ReminderError(409, 'REMINDER_CONFLICT', '该待办 id 已被占用，请重新创建。');
   }
+  const currentRevision = existing ? Number(existing.revision ?? 1) : null;
+  const expected = normalizeRevision(input?.revision);
+  if (existing && expected !== null && expected !== currentRevision) {
+    throw revisionConflict(getReminder(db, ownerId, id));
+  }
+
   const now = nowIso();
   const row = toRow({
     id,
@@ -179,16 +191,23 @@ export function upsertReminder(db, ownerId, input) {
 
   if (existing) {
     // 不覆盖 created_at，保留第一次创建的时间。
-    db.prepare(`UPDATE reminders SET title = ?, type = ?, importance = ?, deadline = ?, remind_at = ?,
-      remind_lead_minutes = ?, recurrence = ?, completed = ?, payload = ?, updated_at = ?, deleted_at = NULL
-      WHERE id = ? AND owner_id = ?`).run(
+    // `AND revision = ?` 是第二道闸：上面那次比较之后、这条 UPDATE 之前，
+    // 另一台设备仍可能写进来。命中 0 行就是这种情况，同样按冲突处理。
+    const result = db.prepare(`UPDATE reminders SET title = ?, type = ?, importance = ?, deadline = ?, remind_at = ?,
+      remind_lead_minutes = ?, recurrence = ?, completed = ?, payload = ?, updated_at = ?, deleted_at = NULL,
+      revision = revision + 1
+      WHERE id = ? AND owner_id = ? AND revision = ?`).run(
       row.title, row.type, row.importance, row.deadline, row.remindAt,
-      row.remindLeadMinutes, row.recurrence, row.completed, payload, row.updatedAt, id, ownerId,
+      row.remindLeadMinutes, row.recurrence, row.completed, payload, row.updatedAt,
+      id, ownerId, currentRevision,
     );
+    if (Number(result.changes) === 0) {
+      throw revisionConflict(getReminder(db, ownerId, id));
+    }
   } else {
     db.prepare(`INSERT INTO reminders (id, owner_id, title, type, importance, deadline, remind_at,
-      remind_lead_minutes, recurrence, completed, payload, created_at, updated_at, deleted_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`).run(
+      remind_lead_minutes, recurrence, completed, payload, created_at, updated_at, deleted_at, revision)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)`).run(
       row.id, ownerId, row.title, row.type, row.importance, row.deadline, row.remindAt,
       row.remindLeadMinutes, row.recurrence, row.completed, payload, row.createdAt, row.updatedAt,
     );
@@ -196,23 +215,58 @@ export function upsertReminder(db, ownerId, input) {
   return getReminder(db, ownerId, id);
 }
 
-export function patchReminder(db, ownerId, id, patch = {}) {
+/** 版本号只接受非负整数；脏值当作「没带」，不因此拒掉整个请求。 */
+function normalizeRevision(value) {
+  if (value === undefined || value === null || value === '') return null;
+  const number = Number(value);
+  return Number.isInteger(number) && number >= 0 ? number : null;
+}
+
+/** 冲突时把服务端当前副本挂在 error 上，HTTP 层会原样带给客户端。 */
+function revisionConflict(current) {
+  const error = new ReminderError(
+    409,
+    'REMINDER_REVISION_CONFLICT',
+    '这条待办在另一台设备上被修改过，请确认保留哪一份。',
+  );
+  error.current = current;
+  return error;
+}
+
+export function patchReminder(db, ownerId, id, patch = {}, { expectedRevision } = {}) {
   const current = getReminder(db, ownerId, id);
   if (!current) throw new ReminderError(404, 'REMINDER_NOT_FOUND', '待办不存在或已删除。');
-  const merged = { ...current, ...patch, id: current.id };
+  const merged = {
+    ...current,
+    ...patch,
+    id: current.id,
+    // 没显式给期望版本时，用刚读到的那一版，交给 upsert 里的条件更新兜住并发。
+    revision: expectedRevision ?? current.revision,
+  };
   return upsertReminder(db, ownerId, merged);
 }
 
-/** 软删：留下墓碑，同步时让其他端把本地那份也删掉。 */
-export function deleteReminder(db, ownerId, id) {
+/**
+ * 软删：留下墓碑，同步时让其他端把本地那份也删掉。
+ *
+ * 同样支持版本前置条件：另一台刚改过内容、这一台还按老样子删，
+ * 会先落一个 409 让用户确认，而不是把对方刚写的东西无声抹掉。
+ */
+export function deleteReminder(db, ownerId, id, { expectedRevision } = {}) {
   const text = assertId(id);
-  const existing = db.prepare('SELECT owner_id FROM reminders WHERE id = ?').get(text);
-  if (!existing || existing.owner_id !== ownerId) {
+  const existing = db.prepare('SELECT owner_id, revision, deleted_at FROM reminders WHERE id = ?').get(text);
+  if (!existing || existing.owner_id !== ownerId || existing.deleted_at) {
     throw new ReminderError(404, 'REMINDER_NOT_FOUND', '待办不存在或已删除。');
   }
+  const expected = normalizeRevision(expectedRevision);
+  const currentRevision = Number(existing.revision ?? 1);
+  if (expected !== null && expected !== currentRevision) {
+    throw revisionConflict(getReminder(db, ownerId, text));
+  }
   const now = nowIso();
-  db.prepare('UPDATE reminders SET deleted_at = ?, updated_at = ? WHERE id = ? AND owner_id = ?')
-    .run(now, now, text, ownerId);
+  db.prepare(`UPDATE reminders SET deleted_at = ?, updated_at = ?, revision = revision + 1
+    WHERE id = ? AND owner_id = ? AND revision = ?`)
+    .run(now, now, text, ownerId, currentRevision);
   return { id: text, deletedAt: now };
 }
 
@@ -250,7 +304,10 @@ export function importLocalReminders(db, ownerId, items) {
       continue;
     }
     try {
-      upsertReminder(db, ownerId, item);
+      // 本地副本可能带着上一个账号留下的 revision，带进去会被误判成冲突。
+      // 导入走「只补缺」，不存在覆盖，所以清掉后按无前置条件的新建处理。
+      const { revision: _ignored, ...rest } = item ?? {};
+      upsertReminder(db, ownerId, rest);
       existing.add(id);
       imported += 1;
     } catch (error) {

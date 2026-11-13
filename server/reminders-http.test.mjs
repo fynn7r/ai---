@@ -226,3 +226,102 @@ describe('待办接口', () => {
     assert.deepEqual(res.body.skipped, ['没有时间的待办']);
   });
 });
+
+/**
+ * 多端同时编辑同一条待办。
+ *
+ * 要守住的是三件事：带对的版本号能正常写；带旧版本号必须被拒且能拿到服务端副本；
+ * 完全不带版本号的老客户端不能被这次改动打死（否则老页面再也存不上东西）。
+ */
+describe('待办版本冲突', () => {
+  let store;
+  let server;
+  let tmp;
+  let laptop;
+  let dorm;
+
+  before(async () => {
+    tmp = mkdtempSync(join(tmpdir(), 'notizhi-reminders-revision-'));
+    store = openKnowledgeDb({ dir: tmp });
+    server = createApiServer(BASE_CONFIG, fetch, null, store);
+    await listen(server);
+    await createFirstAdmin(store.db, { username: 'root', displayName: '管理员', password: 'admin-password-123' });
+    // 同一个账号在「宿舍电脑」和「图书馆电脑」各开一个会话。
+    laptop = makeClient(server);
+    dorm = makeClient(server);
+    await laptop.call('POST', '/api/auth/login', { username: 'root', password: 'admin-password-123' });
+    await dorm.call('POST', '/api/auth/login', { username: 'root', password: 'admin-password-123' });
+  });
+
+  after(() => {
+    server.close();
+    store.close();
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it('新建返回 revision=1，带着它再提交能写进去且版本自增', async () => {
+    const created = await laptop.call('POST', '/api/reminders', reminder({ id: 'v-1' }));
+    assert.equal(created.status, 201, created.text);
+    assert.equal(created.body.reminder.revision, 1);
+
+    const updated = await laptop.call('POST', '/api/reminders', reminder({ id: 'v-1', title: '改过的标题', revision: 1 }));
+    assert.equal(updated.status, 201, updated.text);
+    assert.equal(updated.body.reminder.title, '改过的标题');
+    assert.equal(updated.body.reminder.revision, 2);
+  });
+
+  it('拿着旧版本号覆盖会被拒，并带回服务端当前副本', async () => {
+    // 两台都停在 revision=2：宿舍先改，图书馆后改。
+    const dormWrite = await dorm.call('POST', '/api/reminders', reminder({ id: 'v-1', title: '宿舍改的', revision: 2 }));
+    assert.equal(dormWrite.status, 201, dormWrite.text);
+
+    const stale = await laptop.call('POST', '/api/reminders', reminder({ id: 'v-1', title: '图书馆改的', revision: 2 }));
+    assert.equal(stale.status, 409, stale.text);
+    assert.equal(stale.body.error.code, 'REMINDER_REVISION_CONFLICT');
+    // 关键：必须能拿到对方那一版，否则用户无从判断该保留谁。
+    assert.equal(stale.body.error.current.title, '宿舍改的');
+    assert.equal(stale.body.error.current.revision, 3);
+
+    // 被拒之后服务端内容没有被图书馆那份覆盖掉。
+    const list = await laptop.call('GET', '/api/reminders?status=all');
+    assert.equal(list.body.reminders.find((item) => item.id === 'v-1').title, '宿舍改的');
+  });
+
+  it('接上最新版本号后能正常写入，不再冲突', async () => {
+    const retry = await laptop.call('POST', '/api/reminders', reminder({ id: 'v-1', title: '图书馆改的', revision: 3 }));
+    assert.equal(retry.status, 201, retry.text);
+    assert.equal(retry.body.reminder.title, '图书馆改的');
+    assert.equal(retry.body.reminder.revision, 4);
+  });
+
+  it('不带版本号的老客户端仍按覆盖处理（向后兼容）', async () => {
+    const legacy = await laptop.call('POST', '/api/reminders', reminder({ id: 'v-1', title: '老页面写的' }));
+    assert.equal(legacy.status, 201, legacy.text);
+    assert.equal(legacy.body.reminder.title, '老页面写的');
+  });
+
+  it('删除也认版本号：过期版本先 409，不静默抹掉对方改动', async () => {
+    const current = (await laptop.call('GET', '/api/reminders?status=all')).body.reminders
+      .find((item) => item.id === 'v-1');
+    // 宿舍那边又改了一次，图书馆手里的版本落后。
+    await dorm.call('POST', '/api/reminders', reminder({ id: 'v-1', title: '宿舍又改', revision: current.revision }));
+
+    const stale = await laptop.call('DELETE', `/api/reminders/v-1?revision=${current.revision}`);
+    assert.equal(stale.status, 409, stale.text);
+    assert.equal(stale.body.error.code, 'REMINDER_REVISION_CONFLICT');
+
+    const fresh = await laptop.call('DELETE', `/api/reminders/v-1?revision=${stale.body.error.current.revision}`);
+    assert.equal(fresh.status, 200, fresh.text);
+    assert.equal((await laptop.call('GET', '/api/reminders?status=all')).body.reminders.length, 0);
+  });
+
+  it('PATCH 也能带期望版本号', async () => {
+    await laptop.call('POST', '/api/reminders', reminder({ id: 'p-1' }));
+    const stale = await laptop.call('PATCH', '/api/reminders/p-1', { completed: true, expectedRevision: 99 });
+    assert.equal(stale.status, 409, stale.text);
+    const ok = await laptop.call('PATCH', '/api/reminders/p-1', { completed: true, expectedRevision: 1 });
+    assert.equal(ok.status, 200, ok.text);
+    assert.equal(ok.body.reminder.completed, true);
+    assert.equal(ok.body.reminder.revision, 2);
+  });
+});

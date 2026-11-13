@@ -73,6 +73,12 @@ export interface IReminder {
   attachments?: IAttachment[];
   createdAt: number;
   triggered?: boolean;
+  /**
+   * 服务端版本号，只在登录态有意义：它是「我这条是基于哪一版改的」。
+   * 提交时带上，服务端发现库里已经涨过就会回 409，而不是直接把另一台的改动覆盖掉。
+   * 本地匿名模式和示例数据没有这个字段。
+   */
+  revision?: number;
 }
 
 // 示例提醒：截止日 20 天后，提醒在截止前 2 天（18 天后）

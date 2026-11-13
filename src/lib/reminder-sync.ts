@@ -23,6 +23,15 @@ import { ApiFailure } from '@/lib/knowledge-api';
 
 export type ReminderSyncStatus = 'local' | 'pending-import' | 'syncing' | 'synced' | 'offline';
 
+/** 一条待办在两端被同时改过：服务端拒绝了这次覆盖，等用户决定。 */
+export interface ReminderConflict {
+  id: string;
+  /** 本地当前内容；本地已删时为 null。 */
+  local: IReminder | null;
+  /** 服务端当前副本。 */
+  remote: IReminder;
+}
+
 export interface ReminderSyncState {
   status: ReminderSyncStatus;
   /** 本地有、服务端还没有的条目数，用于「发现 N 条本地待办」提示。 */
@@ -30,13 +39,21 @@ export interface ReminderSyncState {
   /** 还没推上去的变更数。 */
   unsynced: number;
   lastError: string | null;
+  /** 版本冲突待处理，非空时页面要给出「保留哪一份」的选择。 */
+  conflicts: ReminderConflict[];
 }
 
 const MAX_RETRY = 3;
 const FLUSH_DELAY_MS = 400;
 
 let userId: number | null = null;
-let state: ReminderSyncState = { status: 'local', pendingImport: 0, unsynced: 0, lastError: null };
+let state: ReminderSyncState = {
+  status: 'local',
+  pendingImport: 0,
+  unsynced: 0,
+  lastError: null,
+  conflicts: [],
+};
 const listeners = new Set<() => void>();
 const queue = new Map<string, 'upsert' | 'delete'>();
 let timer: ReturnType<typeof setTimeout> | null = null;
@@ -78,7 +95,7 @@ export async function syncAfterAuth(nextUserId: number | null): Promise<void> {
     userId = null;
     queue.clear();
     retry = 0;
-    setState({ status: 'local', pendingImport: 0, unsynced: 0, lastError: null });
+    setState({ status: 'local', pendingImport: 0, unsynced: 0, lastError: null, conflicts: [] });
     return;
   }
   if (userId === nextUserId) return;
@@ -99,7 +116,8 @@ export async function hydrateFromServer(): Promise<void> {
       return;
     }
     reminderStore.hydrate(reminders);
-    setState({ status: 'synced', pendingImport: 0, unsynced: 0 });
+    // 拉取成功说明本地已被服务端副本整体替换，之前的冲突自然消解。
+    setState({ status: 'synced', pendingImport: 0, unsynced: 0, conflicts: [] });
   } catch (error) {
     // 拉取失败不影响本地继续用，降级为「未同步」而不是报错遮断操作。
     setState({
@@ -152,11 +170,18 @@ export async function flush(): Promise<void> {
     const item = reminderStore.findItem(id);
     try {
       if (type === 'delete') {
-        await removeReminder(id);
+        await removeReminder(id, item?.revision);
       } else if (item) {
-        await saveReminder(item);
+        const { reminder } = await saveReminder(item);
+        syncRevision(id, reminder.revision);
       }
     } catch (error) {
+      if (isRevisionConflict(error)) {
+        // 冲突不是「同步失败」，不该进重试队列——再推一次还是同样的冲突。
+        // 记下来交给用户选，期间本地数据保持不动。
+        recordConflict(error, id);
+        continue;
+      }
       // 404 说明服务端已经没有这条（可能是另一端删了），不必重试。
       const missing = error instanceof ApiFailure && error.status === 404;
       if (!missing) {
@@ -183,6 +208,63 @@ export async function flush(): Promise<void> {
   }
   setState({ status: 'syncing', unsynced: queue.size });
   timer = setTimeout(() => { void flush(); }, 1000 * 2 ** retry);
+}
+
+function isRevisionConflict(error: unknown): error is ApiFailure {
+  return error instanceof ApiFailure && error.code === 'REMINDER_REVISION_CONFLICT';
+}
+
+/**
+ * 推成功后要立刻把服务端版本号接回本地。
+ * 不接的话，本地手里永远是旧版本，下一次改动必定误报冲突。
+ * 走 `updateItems` 而不是 `updateItem`：后者会触发 onChange，等于把刚存下去的东西
+ * 再排一次队，形成自我循环。
+ */
+function syncRevision(id: string, revision?: number) {
+  if (typeof revision !== 'number') return;
+  reminderStore.updateItems((prev) => prev.map((item) => (
+    item.id === id && item.revision !== revision ? { ...item, revision } : item
+  )));
+}
+
+function recordConflict(error: ApiFailure, id: string) {
+  const remote = error.details?.current as IReminder | undefined;
+  if (!remote) return;
+  const local = reminderStore.findItem(id) ?? null;
+  const others = state.conflicts.filter((conflict) => conflict.id !== id);
+  setState({
+    conflicts: [...others, { id, local: local ? { ...local } : null, remote }],
+    lastError: null,
+  });
+}
+
+/**
+ * 用户选择保留哪一份。
+ * - `remote`：用服务端副本覆盖本地，不触发回推（这本来就是对方的改动）；
+ * - `local`：把本地内容接上服务端的版本号再推一次，这次条件成立，能真正写进去。
+ */
+export function resolveConflict(id: string, choice: 'local' | 'remote'): void {
+  const conflict = state.conflicts.find((item) => item.id === id);
+  if (!conflict) return;
+  setState({ conflicts: state.conflicts.filter((item) => item.id !== id) });
+
+  const localExists = Boolean(reminderStore.findItem(id));
+  if (choice === 'remote') {
+    if (conflict.local === null) {
+      // 本地已删、服务端还在：按「保留云端」处理，就把这条放回来。
+      reminderStore.addItem(conflict.remote);
+      return;
+    }
+    reminderStore.updateItems((prev) => prev.map((item) => (item.id === id ? conflict.remote : item)));
+    return;
+  }
+
+  if (!localExists) {
+    // 本地已删、但要保留本地意图：带着最新版本号再删一次。
+    void removeReminder(id, conflict.remote.revision);
+    return;
+  }
+  reminderStore.updateItem(id, { revision: conflict.remote.revision });
 }
 
 /** 手动重试，给「未同步」提示条上的按钮用。 */

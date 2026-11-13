@@ -31,10 +31,13 @@ export function patchReminder(id: string, patch: Partial<IReminder>) {
   });
 }
 
-export function removeReminder(id: string) {
-  return apiRequest<{ id: string; deletedAt: string }>(`/api/reminders/${encodeURIComponent(id)}`, {
-    method: 'DELETE',
-  });
+/** 删除同样可以带版本号：另一台改过内容时先回 409，避免无声抹掉对方刚写的改动。 */
+export function removeReminder(id: string, revision?: number) {
+  const suffix = typeof revision === 'number' ? `?revision=${revision}` : '';
+  return apiRequest<{ id: string; deletedAt: string }>(
+    `/api/reminders/${encodeURIComponent(id)}${suffix}`,
+    { method: 'DELETE' },
+  );
 }
 
 export function importLocalReminders(reminders: IReminder[]) {
