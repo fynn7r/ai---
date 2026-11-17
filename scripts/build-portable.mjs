@@ -8,10 +8,10 @@
  * 产物：dist-portable/notizhi-portable-win-x64.zip
  * 结构：node.exe + server/ + shared/ + scripts/ + dist-standalone/ + node_modules/（仅运行依赖）
  */
-import { copyFile, cp, mkdir, writeFile, readFile, rm, stat } from 'node:fs/promises';
+import { cp, mkdir, writeFile, readFile, rm, stat, readdir } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
+import { deflateRawSync } from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
 
@@ -214,47 +214,150 @@ async function installDeps() {
   assertNoLeak();
 }
 
+/**
+ * 自己写 zip。
+ *
+ * 不用系统 tar.exe 的原因：Windows 自带的 bsdtar 3.8 把中文条目名按本地代码页（GBK）
+ * 写进 zip，且没有指定编码的选项，结果 `使用说明书.md` 在包里变成一串乱码字节，
+ * 解压后文件名是坏的。zip 规范里有通用标志位 bit 11 声明「文件名是 UTF-8」，
+ * 自己写就能明确置上，Windows 资源管理器、7-Zip、macOS 归档工具都认。
+ *
+ * 压缩策略：全量 deflate，但跳过本身就是压缩格式的文件（图片、字体、压缩包），
+ * 对它们再压一遍只会白花 CPU。node.exe 看着像二进制，实测 83 MB 能压到 31 MB。
+ */
+const STORE_EXT = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.ico', '.woff', '.woff2', '.zip', '.gz', '.br']);
+
+const CRC_TABLE = (() => {
+  const table = new Int32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    table[i] = c;
+  }
+  return table;
+})();
+
+function crc32(buffer) {
+  let crc = -1;
+  for (let i = 0; i < buffer.length; i++) crc = CRC_TABLE[(crc ^ buffer[i]) & 0xff] ^ (crc >>> 8);
+  return (crc ^ -1) >>> 0;
+}
+
+/** 收集目录下所有文件，返回相对 STAGE 的 posix 路径。 */
+async function walk(dir, base = '') {
+  const entries = [];
+  for (const item of await readdir(dir, { withFileTypes: true })) {
+    const rel = base ? `${base}/${item.name}` : item.name;
+    if (item.isDirectory()) entries.push(...(await walk(resolve(dir, item.name), rel)));
+    else if (item.isFile()) entries.push(rel);
+  }
+  return entries;
+}
+
 async function zip() {
-  log('压缩中（约 1 分钟）…');
+  log('压缩中…');
   await rm(ZIP_PATH, { force: true });
 
-  // 用系统自带的 tar.exe（bsdtar），它比 Compress-Archive 快得多，也不必在运行时
-  // 编译 .NET 代码（部分受限环境会拦截 Add-Type）。
-  const tarBin = resolve(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'tar.exe');
-  if (!existsSync(tarBin)) throw new Error('未找到系统自带的 tar.exe（Windows 10 及以上自带），无法打包。');
+  const files = (await walk(STAGE)).sort();
+  const chunks = [];
+  const central = [];
+  let offset = 0;
 
-  // 归档必须写在被压缩目录之外。tar 的路径参数按模式匹配：若归档名为目录名的前缀
-  // （notizhi-portable-win-x64.zip 之于 notizhi-portable-win-x64），
-  // 它会把正在写入的 zip 自己也收进去，体积无限膨胀（实测 448MB → 6.9GB）。
-  const tempZip = resolve(tmpdir(), `${BUNDLE_NAME}.zip`);
-  await rm(tempZip, { force: true });
-  run(tarBin, ['-a', '-c', '-f', tempZip, '-C', OUT_DIR, BUNDLE_NAME]);
-  await copyFile(tempZip, ZIP_PATH);
-  await rm(tempZip, { force: true });
+  for (const rel of files) {
+    const raw = await readFile(resolve(STAGE, rel));
+    const ext = rel.slice(rel.lastIndexOf('.')).toLowerCase();
+    const tryDeflate = !STORE_EXT.has(ext);
+    const body = tryDeflate ? deflateRawSync(raw, { level: 6 }) : raw;
+    const method = tryDeflate ? 8 : 0;
+    const name = Buffer.from(`${BUNDLE_NAME}/${rel}`, 'utf8');
+    const crc = crc32(raw);
+
+    // 本地文件头
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4); // 解压所需版本 2.0
+    local.writeUInt16LE(0x0800, 6); // bit 11：文件名 UTF-8
+    local.writeUInt16LE(method, 8);
+    local.writeUInt16LE(0, 10); // 修改时间
+    local.writeUInt16LE(0, 12); // 修改日期
+    local.writeUInt32LE(crc, 14);
+    local.writeUInt32LE(body.length, 18);
+    local.writeUInt32LE(raw.length, 22);
+    local.writeUInt16LE(name.length, 26);
+    local.writeUInt16LE(0, 28); // extra 长度
+    chunks.push(local, name, body);
+
+    // 中央目录项
+    const entry = Buffer.alloc(46);
+    entry.writeUInt32LE(0x02014b50, 0);
+    entry.writeUInt16LE(20, 4); // 生成版本
+    entry.writeUInt16LE(20, 6); // 解压所需版本
+    entry.writeUInt16LE(0x0800, 8); // bit 11：文件名 UTF-8
+    entry.writeUInt16LE(method, 10);
+    entry.writeUInt16LE(0, 12);
+    entry.writeUInt16LE(0, 14);
+    entry.writeUInt32LE(crc, 16);
+    entry.writeUInt32LE(body.length, 20);
+    entry.writeUInt32LE(raw.length, 24);
+    entry.writeUInt16LE(name.length, 28);
+    entry.writeUInt16LE(0, 30); // extra
+    entry.writeUInt16LE(0, 32); // comment
+    entry.writeUInt16LE(0, 34); // 磁盘号
+    entry.writeUInt16LE(0, 36); // 内部属性
+    entry.writeUInt32LE(0, 38); // 外部属性
+    entry.writeUInt32LE(offset, 42);
+    central.push(entry, name);
+
+    offset += local.length + name.length + body.length;
+  }
+
+  const centralBuf = Buffer.concat(central);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(0, 4);
+  end.writeUInt16LE(0, 6);
+  end.writeUInt16LE(files.length, 8);
+  end.writeUInt16LE(files.length, 10);
+  end.writeUInt32LE(centralBuf.length, 12);
+  end.writeUInt32LE(offset, 16);
+  end.writeUInt16LE(0, 20);
+
+  await writeFile(ZIP_PATH, Buffer.concat([Buffer.concat(chunks), centralBuf, end]));
 
   const { size } = await stat(ZIP_PATH);
   log(`完成：${ZIP_PATH}`);
-  log(`体积：${(size / 1024 / 1024).toFixed(1)} MB`);
+  log(`体积：${(size / 1024 / 1024).toFixed(1)} MB，${files.length} 个文件`);
 }
 
 /**
  * 回读压缩包确认关键文件都在、中文名没有坏。
- * 用系统自带的 bsdtar 读取（能读 zip 且按 UTF-8 输出），不用 PowerShell：
- * 后者在中文系统上会把条目名按 GBK 输出，出现「文件明明在却报缺失」的假失败。
+ * 直接读中央目录里的 UTF-8 字节自己解，不经过任何外部工具——
+ * 用 tar 或 PowerShell 读都会在中文系统上受代码页影响，出现假失败。
  */
 async function verifyZip() {
-  const tarBin = resolve(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'tar.exe');
-  if (!existsSync(tarBin)) {
-    log('未找到系统 tar，跳过压缩包校验。');
-    return;
+  const buf = await readFile(ZIP_PATH);
+  const eocd = buf.lastIndexOf(Buffer.from([0x50, 0x4b, 0x05, 0x06]));
+  if (eocd < 0) throw new Error('压缩包读取失败，可能是写入过程被中断。');
+
+  const count = buf.readUInt16LE(eocd + 10);
+  let p = buf.readUInt32LE(eocd + 16);
+  const names = [];
+  for (let i = 0; i < count; i++) {
+    if (buf.readUInt32LE(p) !== 0x02014b50) throw new Error('压缩包中央目录损坏。');
+    const flags = buf.readUInt16LE(p + 8);
+    const nameLen = buf.readUInt16LE(p + 28);
+    const extraLen = buf.readUInt16LE(p + 30);
+    const commentLen = buf.readUInt16LE(p + 32);
+    if (!(flags & 0x0800)) throw new Error(`条目未标记 UTF-8：${buf.subarray(p + 46, p + 46 + nameLen).toString('latin1')}`);
+    names.push(buf.subarray(p + 46, p + 46 + nameLen).toString('utf8'));
+    p += 46 + nameLen + extraLen + commentLen;
   }
-  const result = spawnSync(tarBin, ['-tf', ZIP_PATH], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
-  const names = String(result.stdout ?? '').split(/\r?\n/).filter(Boolean);
-  if (!names.length) throw new Error('压缩包读取失败，可能是写入过程被中断。');
+
+  if (!names.length) throw new Error('压缩包里没有任何文件。');
   const required = ['start.bat', '使用说明书.md', 'node.exe', 'scripts/start.mjs'];
   const missing = required.filter((name) => !names.includes(`${BUNDLE_NAME}/${name}`));
   if (missing.length) throw new Error(`压缩包内缺少或文件名损坏：${missing.join('、')}`);
-  log(`压缩包校验通过：${names.length} 个条目，关键文件齐全。`);
+  log(`压缩包校验通过：${names.length} 个条目，关键文件齐全，中文名未损坏。`);
 }
 
 async function main() {
