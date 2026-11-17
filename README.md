@@ -118,7 +118,7 @@
 
 到 [Releases](https://github.com/fynn7r/notification-analysis1.0/releases) 下载 `notizhi-portable-win-x64.zip`，解压后双击 `start.bat`，浏览器会自动打开。压缩包里已经带好 Node 运行时，整台机器不用装任何东西，换电脑也是复制文件夹即可。
 
-首次启动会在窗口里打印管理员账号和密码，**只显示一次**。同目录的 `HOW-TO-START.txt` 写了启动步骤、数据存放位置和常见问题处理。
+首次启动会在窗口里打印管理员账号和密码，**只显示一次**。同目录的 `使用说明书.md` 写了启动步骤、数据存放位置和常见问题处理。
 
 ### 方式二：从源码运行
 
@@ -260,6 +260,7 @@ scripts/           启动、管理、验证脚本
 
 | 文件 | 内容 |
 |---|---|
+| [docs/开发上手指南.md](docs/开发上手指南.md) | **从零跑起来**：环境要求、三条命令、目录导览、改哪里看哪个文件、常见报错 |
 | [SECURITY.md](SECURITY.md) | 已实现的防护清单（密码、会话、CSRF、限流、SSRF、目录穿越、提示注入）、明确的能力边界、部署注意事项 |
 | [DEPLOY.md](DEPLOY.md) | 放到服务器上跑：nginx / Caddy 示例、必须透传的请求头、环境变量、备份命令、检查清单 |
 | [CHANGELOG.md](CHANGELOG.md) | 版本变更记录 |

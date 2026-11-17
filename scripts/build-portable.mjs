@@ -86,6 +86,78 @@ async function stageFiles(pkg) {
   await cp(process.execPath, resolve(STAGE, 'node.exe'));
 }
 
+/**
+ * 便携版使用说明。写成 Markdown：txt 在记事本里没有排版，长文很难读。
+ * 用 \n 而不是 \r\n —— Markdown 靠空行分段，多余的回车只会让 Git 报换行警告。
+ */
+function buildReadme() {
+  return `# 通知智析 便携版
+
+把群通知、公众号文章解析成带截止时间的待办事项。**不需要安装 Node，不需要联网账号，数据全在本机。**
+
+## 一、启动
+
+1. 把压缩包**解压**到任意位置。路径可以有中文，但不要直接在压缩包里双击运行，否则数据会写进临时目录，关掉就没了。
+2. 双击 **\`start.bat\`**。
+3. 等几秒，浏览器会自动打开 <http://127.0.0.1:8001>。
+
+第一次启动时，黑色窗口里会打印**管理员账号和初始密码**，只显示一次。请立刻记下来。
+密码忘了可以删掉 \`.local\` 目录重来，但那样所有数据也会一起清空。
+
+## 二、填模型密钥
+
+解析需要一个大模型，密钥要自己准备。不填也能打开页面、看已有待办，但点「智能解析」会明确提示尚未配置。
+
+进入页面 **「我的 → 模型接入」**，填三样：
+
+| 项 | 填什么 | 示例 |
+|---|---|---|
+| API 基础地址 | 服务商给的根地址，**不要**带 \`/chat/completions\` | \`https://api.deepseek.com\` |
+| API 密钥 | 服务商控制台创建的 key | \`sk-...\` |
+| 默认模型 ID | 用于通知解析的模型 | \`deepseek-flash\` |
+
+保存后立即生效，不用重启。密钥只存在本机的 \`.env.local\` 和 SQLite 里，不会发到浏览器，也不会传给别的服务商。
+
+深度解读和通知生成可以另填模型，留空就用上面那个。要识别图片和截图，还需要填一个支持视觉的模型。
+
+## 三、数据存在哪
+
+所有数据都在这个文件夹里：
+
+\`\`\`
+.local/            待办、知识库、账号，SQLite 数据库在这里
+.env.local         模型配置与密钥
+\`\`\`
+
+- **备份**：整个文件夹复制走即可，包括上面两个。
+- **换电脑**：同样整个复制，Node 运行时已经打在里面，不用另外装。
+- **删除文件夹 = 清空所有数据**，没有云端副本能找回。
+
+## 四、停止服务
+
+关掉那个黑色窗口，或者在窗口里按 \`Ctrl+C\`。
+
+浏览器标签页留着没关系，下次启动还在。
+
+## 五、常见问题
+
+| 现象 | 原因与处理 |
+|---|---|
+| 浏览器打不开 | 服务还没起完，等几秒刷新。窗口里如果已经显示地址就说明起来了 |
+| 端口 8001 被占用 | 关掉占用的程序，或改 \`.env.local\` 里的 \`PORT\` |
+| 解析提示「尚未配置」 | 没填模型密钥，按第二节填 |
+| 解析很慢或超时 | 长通知解读实测约 80 秒；可在 \`.env.local\` 调大 \`AI_TIMEOUT_MS\` |
+| 中文显示成方块 | 窗口编码问题，不影响功能，页面里是正常的 |
+| 提示缺 VC++ 运行库 | 装一次 [Microsoft Visual C++ 运行库](https://aka.ms/vs/17/release/vc_redist.x64.exe) |
+
+## 六、这不是什么
+
+- **不是安装版**，没有注册表、没有开机自启、没有系统托盘。
+- **不会上传你的数据**。唯一的对外请求是调用你自己配置的模型接口。
+- **只支持 Windows x64**。其他系统请用源码版（\`npm install && npm start\`）。
+`;
+}
+
 /** 双击入口。bat 内容保持纯 ASCII：cmd 解析 .bat 用的是本地代码页，塞中文容易乱码。 */
 async function writeLauncher() {
   const bat = [
@@ -104,34 +176,8 @@ async function writeLauncher() {
   ].join('\r\n');
   await writeFile(resolve(STAGE, 'start.bat'), bat, 'utf8');
 
-  const readme = [
-    '通知智析 便携版',
-    '',
-    '使用方法',
-    '  1. 把整个文件夹解压到任意位置（路径可以有中文，但不要直接在压缩包里运行）',
-    '  2. 双击 start.bat',
-    '  3. 稍等几秒，浏览器会自动打开 http://127.0.0.1:8001',
-    '',
-    '首次启动会在窗口里显示管理员账号和密码，只显示一次，请立即记录。',
-    '',
-    '填写模型密钥',
-    '  进入「我的 → 模型接入」，填入 API 地址、密钥和模型名，保存后立即生效。',
-    '  没有密钥也能打开页面、查看待办，但解析会明确提示尚未配置。',
-    '',
-    '数据存在哪',
-    '  所有数据都在本文件夹的 .local 目录里；备份或迁移时复制整个文件夹即可。',
-    '  删除文件夹等于清空所有数据。',
-    '',
-    '停止服务',
-    '  关闭那个黑色窗口，或者在里面按 Ctrl+C。',
-    '',
-    '常见问题',
-    '  浏览器提示无法访问：窗口还没启动完，等几秒刷新一次。',
-    '  端口被占用：关掉占用 8001 的程序，再重新双击 start.bat。',
-    '  换了电脑：整个文件夹复制过去即可，Node 运行时已包含在内，不用另外安装。',
-    '',
-  ].join('\r\n');
-  await writeFile(resolve(STAGE, 'HOW-TO-START.txt'), `\uFEFF${readme}`, 'utf8');
+  const readme = buildReadme();
+  await writeFile(resolve(STAGE, '使用说明书.md'), `\uFEFF${readme}`, 'utf8');
 
   const notices = [
     '本程序打包分发了以下第三方组件，各自保留其原始许可证：',
@@ -205,7 +251,7 @@ async function verifyZip() {
   const result = spawnSync(tarBin, ['-tf', ZIP_PATH], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
   const names = String(result.stdout ?? '').split(/\r?\n/).filter(Boolean);
   if (!names.length) throw new Error('压缩包读取失败，可能是写入过程被中断。');
-  const required = ['start.bat', 'HOW-TO-START.txt', 'node.exe', 'scripts/start.mjs'];
+  const required = ['start.bat', '使用说明书.md', 'node.exe', 'scripts/start.mjs'];
   const missing = required.filter((name) => !names.includes(`${BUNDLE_NAME}/${name}`));
   if (missing.length) throw new Error(`压缩包内缺少或文件名损坏：${missing.join('、')}`);
   log(`压缩包校验通过：${names.length} 个条目，关键文件齐全。`);
